@@ -20,6 +20,7 @@ use crate::merkle::{
     Element,
 };
 use crate::store::{Store, StoreConfig, StoreConfigDataVersion, BUILD_CHUNK_NODES};
+use crate::store::level_cache::{NetReader};
 
 /// The Disk-only store is used to reduce memory to the minimum at the
 /// cost of build time performance. Most of its I/O logic is in the
@@ -29,7 +30,7 @@ pub struct DiskStore<E: Element> {
     len: usize,
     elem_len: usize,
     _e: PhantomData<E>,
-    file: File,
+    pub file: File,
 
     // This flag is useful only immediate after instantiation, which
     // is false if the store was newly initialized and true if the
@@ -43,6 +44,15 @@ pub struct DiskStore<E: Element> {
 }
 
 impl<E: Element> Store<E> for DiskStore<E> {
+    fn new_from_disk_with_net_reader(
+        store_range: usize,
+        branches: usize,
+        config: &StoreConfig,
+        net_reader: NetReader,
+    ) -> Result<Self> {
+        Self::new(store_range)
+    }
+
     fn new_with_config(size: usize, branches: usize, config: StoreConfig) -> Result<Self> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
@@ -459,6 +469,23 @@ impl<E: Element> Store<E> for DiskStore<E> {
 }
 
 impl<E: Element> DiskStore<E> {
+    pub fn new_for_mmap_with_config(
+        size: usize,
+        branches: usize,
+        config: StoreConfig,
+        data_size: usize,
+    ) -> Result<Self> {
+        ensure!(
+            data_size % E::byte_len() == 0,
+            "data size must be a multiple of {}",
+            E::byte_len()
+        );
+
+        let mut store = Self::new_with_config(size, branches, config)?;
+        store.len = data_size / store.elem_len;
+        Ok(store)
+    }
+
     fn set_len(&mut self, len: usize) {
         self.len = len;
     }

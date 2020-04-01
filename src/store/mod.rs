@@ -38,7 +38,7 @@ mod mmap;
 mod vec;
 
 pub use disk::DiskStore;
-pub use level_cache::LevelCacheStore;
+pub use level_cache::{LevelCacheStore, NetReader};
 pub use mmap::MmapStore;
 pub use vec::VecStore;
 
@@ -198,6 +198,13 @@ impl StoreConfig {
 
 /// Backing store of the merkle tree.
 pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
+    fn new_from_disk_with_net_reader(
+        store_range: usize,
+        branches: usize,
+        config: &StoreConfig,
+        net_reader: NetReader,
+    ) -> Result<Self>;
+
     /// Creates a new store which can store up to `size` elements.
     fn new_with_config(size: usize, branches: usize, config: StoreConfig) -> Result<Self>;
     fn new(size: usize) -> Result<Self>;

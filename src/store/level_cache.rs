@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use memmap::MmapOptions;
-use positioned_io::{ReadAt, WriteAt};
+use positioned_io::{ReadAt, WriteAt, Size};
 use rayon::iter::*;
 use rayon::prelude::*;
 use tempfile::tempfile;
@@ -21,6 +21,64 @@ use crate::merkle::{
     Element,
 };
 use crate::store::{ExternalReader, Store, StoreConfig, BUILD_CHUNK_NODES};
+
+type NetReaderCallback = fn(sector_id: u64, cache_id: *const libc::c_char, offset: u64, size: u64, buf: *mut libc::c_char) -> u64;
+
+#[allow(missing_debug_implementations)]
+#[derive(Clone, Default)]
+pub struct NetReader {
+    pub empty: bool,
+    pub sector_id: u64,
+    pub cache_id: String,
+    pub offset: usize,
+    pub net_read_cb: Option<NetReaderCallback>,
+}
+
+impl NetReader {
+    pub fn readable(&self) -> bool {
+        self.net_read_cb.is_some()
+    }
+
+    pub fn net_read(&self, sector_id: u64, cache_id: String, offset: u64, size: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (self.net_read_cb.unwrap())(
+            sector_id,
+            std::ffi::CString::new(cache_id).unwrap().as_ptr(),
+            offset,
+            size,
+            buf.as_mut_ptr() as *mut libc::c_char,
+        );
+        if n != u64::max_value() {
+            Ok(n as usize)
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::Other))
+        }
+    }
+}
+
+impl ReadAt for NetReader {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.net_read(self.sector_id, self.cache_id.clone(), pos, buf.size().unwrap().unwrap(), buf)
+    }
+}
+
+pub trait ExternalRead {
+    fn external_read(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<usize>;
+}
+
+impl ExternalRead for NetReader {
+    fn external_read(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<usize> {
+        let start = start + self.offset;
+        let end = end + self.offset;
+        self.net_read(self.sector_id, String::new(), start as u64, (end - start) as u64, &mut buf[0..end - start])?;
+        Ok(end - start)
+    }
+}
+
+impl<R: Read + Send + Sync> ExternalRead for ExternalReader<R> {
+    fn external_read(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<usize> {
+        self.read(start, end, buf)
+    }
+}
 
 /// The LevelCacheStore is used to reduce the on-disk footprint even
 /// further to the minimum at the cost of build time performance.
@@ -34,6 +92,7 @@ pub struct LevelCacheStore<E: Element, R: Read + Send + Sync> {
     len: usize,
     elem_len: usize,
     file: File,
+    net_reader: NetReader,
 
     // The number of base layer data items.
     data_width: usize,
@@ -117,6 +176,7 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             len: store_range / E::byte_len(),
             elem_len: E::byte_len(),
             file,
+            net_reader: NetReader::default(),
             data_width: size,
             cache_index_start,
             store_size,
@@ -134,6 +194,48 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 }
 
 impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
+    fn new_from_disk_with_net_reader(
+        store_range: usize,
+        branches: usize,
+        config: &StoreConfig,
+        net_reader: NetReader,
+    ) -> Result<Self> {
+        // The LevelCacheStore base data layer must already be a
+        // massaged next pow2 (guaranteed if created with
+        // DiskStore::compact, which is the only supported method at
+        // the moment).
+        let size = get_merkle_tree_leafs(store_range, branches)?;
+        ensure!(
+            size == next_pow2(size),
+            "Inconsistent merkle tree height detected"
+        );
+
+        // Values below in bytes.
+        // Convert store_range from an element count to bytes.
+        let store_range = store_range * E::byte_len();
+
+        // LevelCacheStore on disk file is only the cached data, so
+        // the file size dictates the cache_size.  Calculate cache
+        // start and the updated size with repect to the file size.
+        let cache_size = get_merkle_tree_cache_size(size, branches, config.levels)? * E::byte_len();
+        let cache_index_start = store_range - cache_size;
+
+        let file = tempfile()?;
+
+        Ok(LevelCacheStore {
+            len: store_range / E::byte_len(),
+            elem_len: E::byte_len(),
+            file,
+            net_reader,
+            data_width: size,
+            cache_index_start,
+            store_size: cache_size,
+            loaded_from_disk: false,
+            reader: None,
+            _e: Default::default(),
+        })
+    }
+
     fn new_with_config(size: usize, branches: usize, config: StoreConfig) -> Result<Self> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
@@ -171,6 +273,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             len: 0,
             elem_len: E::byte_len(),
             file,
+            net_reader: NetReader::default(),
             data_width: leafs,
             cache_index_start,
             store_size,
@@ -189,6 +292,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             len: 0,
             elem_len: E::byte_len(),
             file,
+            net_reader: NetReader::default(),
             data_width: size,
             cache_index_start: 0,
             store_size,
@@ -283,6 +387,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             len: store_range / E::byte_len(),
             elem_len: E::byte_len(),
             file,
+            net_reader: NetReader::default(),
             data_width: size,
             cache_index_start,
             loaded_from_disk: true,
@@ -683,11 +788,14 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         );
 
         // If an external reader was specified for the base layer, use it.
-        if start < self.data_width * self.elem_len && self.reader.is_some() {
-            self.reader
-                .as_ref()
-                .unwrap()
-                .read(start, end, &mut read_data)
+        if start < self.data_width * self.elem_len && (self.reader.is_some() || self.net_reader.readable()) {
+            let reader: &dyn ExternalRead = if self.net_reader.readable() {
+                &self.net_reader
+            } else {
+                self.reader.as_ref().unwrap()
+            };
+            reader
+                .external_read(start, end, &mut read_data)
                 .with_context(|| {
                     format!(
                         "failed to read {} bytes from file at offset {}",
@@ -702,7 +810,7 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         // Adjust read index if in the cached ranged to be shifted
         // over since the data stored is compacted.
         if start >= self.cache_index_start {
-            let v1 = self.reader.is_none();
+            let v1 = self.reader.is_none() && !self.net_reader.readable();
             adjusted_start = if v1 {
                 start - self.cache_index_start + (self.data_width * self.elem_len)
             } else {
@@ -710,7 +818,12 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             };
         }
 
-        self.file
+        let reader: &dyn ReadAt = if self.net_reader.readable() {
+            &self.net_reader
+        } else {
+            &self.file
+        };
+        reader
             .read_exact_at(adjusted_start as u64, &mut read_data)
             .with_context(|| {
                 format!(
@@ -785,11 +898,14 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         );
 
         // If an external reader was specified for the base layer, use it.
-        if start < self.data_width * self.elem_len && self.reader.is_some() {
-            self.reader
-                .as_ref()
-                .unwrap()
-                .read(start, end, buf)
+        if start < self.data_width * self.elem_len && (self.reader.is_some() || self.net_reader.readable()) {
+            let reader: &dyn ExternalRead = if self.net_reader.readable() {
+                &self.net_reader
+            } else {
+                self.reader.as_ref().unwrap()
+            };
+            reader
+                .external_read(start, end, buf)
                 .with_context(|| {
                     format!(
                         "failed to read {} bytes from file at offset {}",
@@ -801,7 +917,7 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             // Adjust read index if in the cached ranged to be shifted
             // over since the data stored is compacted.
             let adjusted_start = if start >= self.cache_index_start {
-                if self.reader.is_none() {
+                if self.reader.is_none() && !self.net_reader.readable() {
                     // if v1
                     start - self.cache_index_start + (self.data_width * self.elem_len)
                 } else {
@@ -811,7 +927,12 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
                 start
             };
 
-            self.file
+            let reader: &dyn ReadAt = if self.net_reader.readable() {
+                &self.net_reader
+            } else {
+                &self.file
+            };
+            reader
                 .read_exact_at(adjusted_start as u64, buf)
                 .with_context(|| {
                     format!(
