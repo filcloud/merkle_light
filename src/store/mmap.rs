@@ -8,6 +8,7 @@ use memmap::MmapMut;
 
 use crate::merkle::Element;
 use crate::store::{Store, StoreConfig};
+use crate::store::level_cache::{NetReader};
 
 /// Store that saves the data on disk, and accesses it using memmap.
 #[derive(Debug)]
@@ -29,6 +30,15 @@ impl<E: Element> ops::Deref for MmapStore<E> {
 }
 
 impl<E: Element> Store<E> for MmapStore<E> {
+    fn new_from_disk_with_net_reader(
+        store_range: usize,
+        branches: usize,
+        config: &StoreConfig,
+        net_reader: NetReader,
+    ) -> Result<Self> {
+        Self::new(store_range)
+    }
+
     #[allow(unsafe_code)]
     fn new_with_config(size: usize, branches: usize, config: StoreConfig) -> Result<Self> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);

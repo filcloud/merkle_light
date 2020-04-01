@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::merkle::Element;
 use crate::store::{Store, StoreConfig};
+use crate::store::level_cache::{NetReader};
 
 #[derive(Debug, Clone, Default)]
 pub struct VecStore<E: Element>(Vec<E>);
@@ -17,6 +18,15 @@ impl<E: Element> ops::Deref for VecStore<E> {
 }
 
 impl<E: Element> Store<E> for VecStore<E> {
+    fn new_from_disk_with_net_reader(
+        store_range: usize,
+        branches: usize,
+        config: &StoreConfig,
+        net_reader: NetReader,
+    ) -> Result<Self> {
+        Self::new(store_range)
+    }
+
     fn new_with_config(size: usize, _branches: usize, _config: StoreConfig) -> Result<Self> {
         Self::new(size)
     }
