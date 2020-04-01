@@ -38,7 +38,7 @@ mod mmap;
 mod vec;
 
 pub use disk::DiskStore;
-pub use level_cache::LevelCacheStore;
+pub use level_cache::{LevelCacheStore, NetReader};
 pub use mmap::MmapStore;
 pub use vec::VecStore;
 
