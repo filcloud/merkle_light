@@ -7,6 +7,7 @@ use std::ops;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use log::warn;
 use anyhow::{Context, Result};
 use memmap::MmapOptions;
 use positioned_io::{ReadAt, WriteAt};
@@ -21,6 +22,7 @@ use crate::merkle::{
     Element,
 };
 use crate::store::{ExternalReader, Store, StoreConfig, BUILD_CHUNK_NODES};
+use crate::store::disk_lock::LockedFile;
 
 /// The LevelCacheStore is used to reduce the on-disk footprint even
 /// further to the minimum at the cost of build time performance.
@@ -33,7 +35,7 @@ use crate::store::{ExternalReader, Store, StoreConfig, BUILD_CHUNK_NODES};
 pub struct LevelCacheStore<E: Element, R: Read + Send + Sync> {
     len: usize,
     elem_len: usize,
-    file: File,
+    file: LockedFile,
 
     // The number of base layer data items.
     data_width: usize,
@@ -81,6 +83,7 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
         let file = File::open(data_path)?;
+        let file = LockedFile::new(file);
         let metadata = file.metadata()?;
         let store_size = metadata.len() as usize;
 
@@ -131,6 +134,10 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 
         Ok(())
     }
+
+    pub fn set_no_lock(&mut self, no_lock: bool) {
+        self.file.no_lock = no_lock;
+    }
 }
 
 impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
@@ -150,6 +157,8 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             .read(true)
             .create_new(true)
             .open(data_path)?;
+
+        let file = LockedFile::new(file);
 
         let store_size = E::byte_len() * size;
         let leafs = get_merkle_tree_leafs(size, branches)?;
@@ -183,6 +192,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
     fn new(size: usize) -> Result<Self> {
         let store_size = E::byte_len() * size;
         let file = tempfile()?;
+        let file = LockedFile::new(file);
         file.set_len(store_size as u64)?;
 
         Ok(LevelCacheStore {
@@ -243,6 +253,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
         let file = File::open(data_path)?;
+        let file = LockedFile::new(file);
         let metadata = file.metadata()?;
         let store_size = metadata.len() as usize;
 
@@ -426,15 +437,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
         read_start: usize,
         write_start: usize,
     ) -> Result<()> {
-        // Safety: this operation is safe becase it's a limited
-        // writable region on the backing store managed by this type.
-        let mut mmap = unsafe {
-            let mut mmap_options = MmapOptions::new();
-            mmap_options
-                .offset((write_start * E::byte_len()) as u64)
-                .len(width * E::byte_len())
-                .map_mut(&self.file)
-        }?;
+        warn!("process_layer begin");
 
         let data_lock = Arc::new(RwLock::new(self));
         let branches = U::to_usize();
@@ -442,10 +445,9 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
         let write_chunk_width = (BUILD_CHUNK_NODES >> shift) * E::byte_len();
 
         ensure!(BUILD_CHUNK_NODES % branches == 0, "Invalid chunk size");
-        Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
+        let hashed_nodes_as_bytes_vec = Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
             .into_par_iter()
-            .zip(mmap.par_chunks_mut(write_chunk_width))
-            .try_for_each(|(chunk_index, write_mmap)| -> Result<()> {
+            .map(|chunk_index| -> Result<Vec<u8>> {
                 let chunk_size = std::cmp::min(BUILD_CHUNK_NODES, read_start + width - chunk_index);
 
                 let chunk_nodes = {
@@ -467,16 +469,24 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
                 );
 
                 // Check that we correctly pre-allocated the space.
-                let hashed_nodes_as_bytes_len = hashed_nodes_as_bytes.len();
                 ensure!(
                     hashed_nodes_as_bytes.len() == chunk_size / branches * E::byte_len(),
                     "Invalid hashed node length"
                 );
 
-                write_mmap[0..hashed_nodes_as_bytes_len].copy_from_slice(&hashed_nodes_as_bytes);
-
-                Ok(())
+                Ok(hashed_nodes_as_bytes)
             })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (i, hashed_nodes_as_bytes) in hashed_nodes_as_bytes_vec.iter().enumerate() {
+            data_lock
+                .write()
+                .unwrap().store_copy_from_slice(write_start * E::byte_len() + i * write_chunk_width, &hashed_nodes_as_bytes)?;
+        }
+
+        warn!("process_layer end");
+
+        Ok(())
     }
 
     // LevelCacheStore specific merkle-tree build.
@@ -586,10 +596,12 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         reader.seek(SeekFrom::Start(len))?;
 
         // Make sure the store file is opened for read/write.
-        self.file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
+
+        self.file = LockedFile::new(file);
 
         // Seek the writer.
         self.file.seek(SeekFrom::Start(0))?;

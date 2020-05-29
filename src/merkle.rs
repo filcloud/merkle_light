@@ -13,6 +13,7 @@ use crate::proof::Proof;
 use crate::store::{
     ExternalReader, LevelCacheStore, ReplicaConfig, Store, StoreConfig, VecStore, BUILD_CHUNK_NODES,
 };
+use crate::store::disk_lock::LockedFile;
 
 // Number of batched nodes processed and stored together when
 // populating from the data leaves.
@@ -198,7 +199,7 @@ impl<
         SubTreeArity: Unsigned,
         TopTreeArity: Unsigned,
     >
-    MerkleTree<E, A, LevelCacheStore<E, std::fs::File>, BaseTreeArity, SubTreeArity, TopTreeArity>
+    MerkleTree<E, A, LevelCacheStore<E, LockedFile>, BaseTreeArity, SubTreeArity, TopTreeArity>
 {
     /// Given a pathbuf, instantiate an ExternalReader and set it for the LevelCacheStore.
     pub fn set_external_reader_path(&mut self, path: &PathBuf) -> Result<()> {
@@ -225,7 +226,7 @@ impl<
         MerkleTree<
             E,
             A,
-            LevelCacheStore<E, std::fs::File>,
+            LevelCacheStore<E, LockedFile>,
             BaseTreeArity,
             SubTreeArity,
             TopTreeArity,
@@ -270,7 +271,7 @@ impl<
         MerkleTree<
             E,
             A,
-            LevelCacheStore<E, std::fs::File>,
+            LevelCacheStore<E, LockedFile>,
             BaseTreeArity,
             SubTreeArity,
             TopTreeArity,

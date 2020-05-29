@@ -6,6 +6,7 @@ use std::ops;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use log::warn;
 use anyhow::{Context, Result};
 use memmap::MmapOptions;
 use positioned_io::{ReadAt, WriteAt};
@@ -20,6 +21,7 @@ use crate::merkle::{
     Element,
 };
 use crate::store::{Store, StoreConfig, StoreConfigDataVersion, BUILD_CHUNK_NODES};
+use crate::store::disk_lock::LockedFile;
 
 /// The Disk-only store is used to reduce memory to the minimum at the
 /// cost of build time performance. Most of its I/O logic is in the
@@ -29,7 +31,7 @@ pub struct DiskStore<E: Element> {
     len: usize,
     elem_len: usize,
     _e: PhantomData<E>,
-    file: File,
+    file: LockedFile,
 
     // This flag is useful only immediate after instantiation, which
     // is false if the store was newly initialized and true if the
@@ -58,6 +60,8 @@ impl<E: Element> Store<E> for DiskStore<E> {
             .create_new(true)
             .open(data_path)?;
 
+        let file = LockedFile::new(file);
+
         let store_size = E::byte_len() * size;
         file.set_len(store_size as u64)?;
 
@@ -74,6 +78,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
     fn new(size: usize) -> Result<Self> {
         let store_size = E::byte_len() * size;
         let file = tempfile()?;
+        let file = LockedFile::new(file);
         file.set_len(store_size as u64)?;
 
         Ok(DiskStore {
@@ -130,6 +135,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
         let file = File::open(&data_path)?;
+        let file = LockedFile::new(file);
         let metadata = file.metadata()?;
         let store_size = metadata.len() as usize;
 
@@ -268,10 +274,12 @@ impl<E: Element> Store<E> for DiskStore<E> {
         reader.seek(SeekFrom::Start(cache_start as u64))?;
 
         // Make sure the store file is opened for read/write.
-        self.file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
+
+        self.file = LockedFile::new(file);
 
         // Seek the writer.
         self.file.seek(SeekFrom::Start(start))?;
@@ -341,15 +349,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
         read_start: usize,
         write_start: usize,
     ) -> Result<()> {
-        // Safety: this operation is safe becase it's a limited
-        // writable region on the backing store managed by this type.
-        let mut mmap = unsafe {
-            let mut mmap_options = MmapOptions::new();
-            mmap_options
-                .offset((write_start * E::byte_len()) as u64)
-                .len(width * E::byte_len())
-                .map_mut(&self.file)
-        }?;
+        warn!("process_layer begin");
 
         let data_lock = Arc::new(RwLock::new(self));
         let branches = U::to_usize();
@@ -357,10 +357,9 @@ impl<E: Element> Store<E> for DiskStore<E> {
         let write_chunk_width = (BUILD_CHUNK_NODES >> shift) * E::byte_len();
 
         ensure!(BUILD_CHUNK_NODES % branches == 0, "Invalid chunk size");
-        Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
+        let hashed_nodes_as_bytes_vec = Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
             .into_par_iter()
-            .zip(mmap.par_chunks_mut(write_chunk_width))
-            .try_for_each(|(chunk_index, write_mmap)| -> Result<()> {
+            .map(|chunk_index| -> Result<Vec<u8>> {
                 let chunk_size = std::cmp::min(BUILD_CHUNK_NODES, read_start + width - chunk_index);
 
                 let chunk_nodes = {
@@ -382,16 +381,24 @@ impl<E: Element> Store<E> for DiskStore<E> {
                 );
 
                 // Check that we correctly pre-allocated the space.
-                let hashed_nodes_as_bytes_len = hashed_nodes_as_bytes.len();
                 ensure!(
                     hashed_nodes_as_bytes.len() == chunk_size / branches * E::byte_len(),
                     "Invalid hashed node length"
                 );
 
-                write_mmap[0..hashed_nodes_as_bytes_len].copy_from_slice(&hashed_nodes_as_bytes);
-
-                Ok(())
+                Ok(hashed_nodes_as_bytes)
             })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (i, hashed_nodes_as_bytes) in hashed_nodes_as_bytes_vec.iter().enumerate() {
+            data_lock
+                .write()
+                .unwrap().store_copy_from_slice(write_start * E::byte_len() + i * write_chunk_width, &hashed_nodes_as_bytes)?;
+        }
+
+        warn!("process_layer end");
+
+        Ok(())
     }
 
     // DiskStore specific merkle-tree build.

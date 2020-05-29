@@ -21,6 +21,8 @@ pub const DEFAULT_CACHED_ABOVE_BASE_LAYER_BINARY: usize = 7;
 pub const DEFAULT_CACHED_ABOVE_BASE_LAYER_QUAD: usize = 4;
 pub const DEFAULT_CACHED_ABOVE_BASE_LAYER_OCT: usize = 2;
 
+use crate::store::disk_lock::LockedFile;
+
 /// Tree size (number of nodes) used as threshold to decide which build algorithm
 /// to use. Small trees (below this value) use the old build algorithm, optimized
 /// for speed rather than memory, allocating as much as needed to allow multiple
@@ -36,6 +38,7 @@ mod disk;
 mod level_cache;
 mod mmap;
 mod vec;
+pub mod disk_lock;
 
 pub use disk::DiskStore;
 pub use level_cache::LevelCacheStore;
@@ -55,14 +58,19 @@ impl<R: Read + Send + Sync> ExternalReader<R> {
     }
 }
 
-impl ExternalReader<std::fs::File> {
+impl ExternalReader<LockedFile> {
     pub fn new_from_config(replica_config: &ReplicaConfig, index: usize) -> Result<Self> {
+        ExternalReader::new_from_config_with_lock(replica_config, index, false) // defaults to lock
+    }
+
+    pub fn new_from_config_with_lock(replica_config: &ReplicaConfig, index: usize, no_lock: bool) -> Result<Self> {
         let reader = OpenOptions::new().read(true).open(&replica_config.path)?;
+        let reader = LockedFile::new_lock(reader, no_lock);
 
         Ok(ExternalReader {
             offset: replica_config.offsets[index],
             source: reader,
-            read_fn: |start, end, buf: &mut [u8], reader: &std::fs::File| {
+            read_fn: |start, end, buf: &mut [u8], reader: &LockedFile| {
                 reader.read_exact_at(start as u64, &mut buf[0..end - start])?;
 
                 Ok(end - start)

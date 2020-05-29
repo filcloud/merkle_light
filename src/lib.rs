@@ -1,3 +1,5 @@
+#![feature(read_initializer)]
+
 //! light _Merkle Tree_ implementation.
 //!
 //! Merkle tree (MT) implemented as a full binary tree allocated as a vec
@@ -154,7 +156,6 @@
     trivial_casts,
     trivial_numeric_casts,
     unsafe_code,
-    unstable_features,
     unused_import_braces
 )]
 #![cfg_attr(feature = "nightly", allow(unstable_features))]
